@@ -1,5 +1,5 @@
 name = "loop-api"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2024-11-01"
 
 # ── D1 database ──────────────────────────────────────────────────────────
@@ -8,7 +8,7 @@ compatibility_date = "2024-11-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "loop_db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "32703683-05ca-44d9-852e-d4f72d3ca04b"
 
 # ── Durable Object (real-time chat + live viewer count per stream) ──────
 [[durable_objects.bindings]]
