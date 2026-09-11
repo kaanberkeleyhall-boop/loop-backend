@@ -17,7 +17,7 @@ class_name = "ChatRoom"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatRoom"]
+new_sqlite_classes = ["ChatRoom"]
 
 # ── Secrets (never put these in this file — set them with wrangler) ─────
 # wrangler secret put STRIPE_SECRET_KEY
