@@ -1,0 +1,28 @@
+name = "loop-api"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# ── D1 database ──────────────────────────────────────────────────────────
+# Create with:  wrangler d1 create loop_db
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "loop_db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# ── Durable Object (real-time chat + live viewer count per stream) ──────
+[[durable_objects.bindings]]
+name = "CHAT_ROOM"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatRoom"]
+
+# ── Secrets (never put these in this file — set them with wrangler) ─────
+# wrangler secret put STRIPE_SECRET_KEY
+# wrangler secret put STRIPE_WEBHOOK_SECRET
+# wrangler secret put CF_API_TOKEN            (Cloudflare Stream: Edit permission)
+# wrangler secret put CF_ACCOUNT_ID
+# wrangler secret put CF_STREAM_CUSTOMER_CODE (from the Cloudflare Stream dashboard, e.g. "abcd1234")
+# wrangler secret put ALLOWED_ORIGIN          (e.g. https://loop-live.com — your site's real origin)
