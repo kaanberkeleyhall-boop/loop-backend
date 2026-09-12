@@ -9,6 +9,11 @@ import { ChatRoom } from "./chatRoom.js";
 export { ChatRoom };
 
 const TOKEN_TTL_DAYS = 30;
+// Loop's cut of every tip. The remainder routes automatically to the DJ's
+// own connected Stripe account the instant a tip is paid (see the
+// payment_intent_data on /api/tips/checkout below) — only once that DJ has
+// finished Stripe's own onboarding (see /api/connect/onboard).
+const PLATFORM_FEE_PERCENT = 10;
 
 // ── small helpers ─────────────────────────────────────────────────────────
 function bytesToHex(bytes) {
@@ -218,6 +223,9 @@ function privateUser(row, env) {
     isAdmin: env ? isAdminEmail(env, row.email) : false,
     emailVerified: !!row.email_verified,
     notifyOnLive: row.notify_on_live == null ? true : !!row.notify_on_live,
+    // none = never started · pending = started but Stripe hasn't cleared
+    // them to receive payouts yet · active = tips now split to them automatically.
+    stripeConnectStatus: row.stripe_connect_account_id ? (row.stripe_connect_payouts_enabled ? "active" : "pending") : "none",
   };
 }
 function publicVerification(row) {
@@ -1024,7 +1032,7 @@ async function handle(request, env, ctx) {
     if (!dj) return err("DJ not found.", 404);
     const origin = env.ALLOWED_ORIGIN || request.headers.get("Origin") || "https://example.com";
     const tipId = genId("tip");
-    const session = await stripeRequest(env, "POST", "/checkout/sessions", {
+    const sessionParams = {
       mode: "payment",
       line_items: [
         {
@@ -1039,7 +1047,20 @@ async function handle(request, env, ctx) {
       success_url: `${origin}/?tip_session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${origin}/?tip_cancelled=1`,
       metadata: { tipId, toDjId: body.toDjId, fromUserId: user.id, streamId: body.streamId || "", tierName: body.tierName || "", message: (body.message || "").slice(0, 120) },
-    });
+    };
+    // Split the payment at the moment it's paid: Loop's cut stays in the
+    // platform balance, the rest transfers straight to the DJ's own
+    // connected Stripe account — but only once that account is actually
+    // cleared to receive payouts. Until then (or if they've never
+    // connected one), the whole tip lands in the platform balance instead,
+    // same as before.
+    if (dj.stripe_connect_account_id && dj.stripe_connect_payouts_enabled) {
+      sessionParams.payment_intent_data = {
+        application_fee_amount: Math.round((amountCents * PLATFORM_FEE_PERCENT) / 100),
+        transfer_data: { destination: dj.stripe_connect_account_id },
+      };
+    }
+    const session = await stripeRequest(env, "POST", "/checkout/sessions", sessionParams);
     await env.DB.prepare(`INSERT INTO tips (id, stripe_session_id, from_user_id, to_dj_id, stream_id, amount_cents, tier_name, message, status) VALUES (?,?,?,?,?,?,?,?, 'pending')`)
       .bind(tipId, session.id, user.id, body.toDjId, body.streamId || null, amountCents, body.tierName || null, body.message || null)
       .run();
@@ -1075,6 +1096,50 @@ async function handle(request, env, ctx) {
         fromName: fromUser?.display_name || "Someone",
       },
     });
+  }
+
+  // Payouts (Stripe Connect) ---------------------------------------------
+  // Lets a DJ link their own bank account so their share of every tip
+  // routes to them automatically the instant it's paid (see
+  // PLATFORM_FEE_PERCENT and /api/tips/checkout above). Stripe hosts the
+  // actual "enter your bank details / verify your identity" flow — this
+  // server only creates the connected account, asks Stripe for a link to
+  // that hosted flow, and later re-checks whether the account is cleared.
+  if (path === "/api/connect/onboard" && method === "POST") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    if (!user.is_dj) return err("Only DJ accounts can connect a payout method.", 403);
+    const origin = env.ALLOWED_ORIGIN || request.headers.get("Origin") || "https://example.com";
+    let accountId = user.stripe_connect_account_id;
+    if (!accountId) {
+      const acct = await stripeRequest(env, "POST", "/accounts", {
+        type: "express",
+        email: user.email,
+        business_type: "individual",
+        capabilities: { transfers: { requested: true } },
+      });
+      accountId = acct.id;
+      await env.DB.prepare(`UPDATE users SET stripe_connect_account_id=? WHERE id=?`).bind(accountId, user.id).run();
+    }
+    const link = await stripeRequest(env, "POST", "/account_links", {
+      account: accountId,
+      refresh_url: `${origin}/?connect_refresh=1`,
+      return_url: `${origin}/?connect_return=1`,
+      type: "account_onboarding",
+    });
+    return json({ url: link.url });
+  }
+
+  if (path === "/api/connect/refresh" && method === "POST") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    if (user.stripe_connect_account_id) {
+      const acct = await stripeRequest(env, "GET", `/accounts/${user.stripe_connect_account_id}`);
+      const enabled = !!(acct.details_submitted && acct.payouts_enabled);
+      await env.DB.prepare(`UPDATE users SET stripe_connect_payouts_enabled=? WHERE id=?`).bind(enabled ? 1 : 0, user.id).run();
+    }
+    const updated = await env.DB.prepare(`SELECT * FROM users WHERE id=?`).bind(user.id).first();
+    return json({ user: privateUser(updated, env) });
   }
 
   if (path === "/webhooks/stripe" && method === "POST") {
