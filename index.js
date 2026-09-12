@@ -91,6 +91,45 @@ function isAdminEmail(env, email) {
   const list = env.ADMIN_EMAILS.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
   return list.includes(email.trim().toLowerCase());
 }
+
+// ── security: brute-force / spam-signup throttling ───────────────────────
+// A real, server-enforced limit (not just a UI hint) — checked against D1
+// so it holds up across Worker restarts and multiple edge locations, unlike
+// an in-memory counter. Old rows are cheap to leave behind; each check only
+// looks inside its own recent window.
+const RATE_LIMITS = {
+  login: { max: 8, windowMinutes: 15 },
+  signup: { max: 6, windowMinutes: 60 },
+};
+function clientIp(request) {
+  return request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
+}
+async function checkRateLimit(env, kind, key) {
+  const cfg = RATE_LIMITS[kind];
+  const since = new Date(Date.now() - cfg.windowMinutes * 60000).toISOString();
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM rate_limit_events WHERE kind=? AND rkey=? AND created_at > ?`)
+    .bind(kind, key, since)
+    .first();
+  return (row?.n || 0) < cfg.max;
+}
+async function recordRateLimitEvent(env, kind, key) {
+  await env.DB.prepare(`INSERT INTO rate_limit_events (kind, rkey) VALUES (?,?)`).bind(kind, key).run();
+}
+
+// ── security: moderators & chat bans ─────────────────────────────────────
+async function isModeratorFor(env, djId, userId) {
+  if (!userId) return false;
+  const row = await env.DB.prepare(`SELECT 1 FROM moderators WHERE dj_id=? AND moderator_id=?`).bind(djId, userId).first();
+  return !!row;
+}
+async function chatRoleFor(env, djId, userId) {
+  if (userId && userId === djId) return "dj";
+  if (await isModeratorFor(env, djId, userId)) return "moderator";
+  return "viewer";
+}
+function publicModerator(row) {
+  return { userId: row.id, username: row.username, displayName: row.display_name, grantedAt: row.created_at };
+}
 function privateUser(row, env) {
   return {
     ...publicUser(row),
@@ -276,11 +315,14 @@ async function handle(request, env) {
 
   // Auth ---------------------------------------------------------------
   if (path === "/api/signup" && method === "POST") {
+    const ip = clientIp(request);
+    if (!(await checkRateLimit(env, "signup", ip))) return err("Too many accounts created from this connection recently. Please try again later.", 429);
     const body = await request.json();
     const email = (body.email || "").trim().toLowerCase();
     const displayName = (body.displayName || "").trim();
     const password = body.password || "";
     if (!email || !displayName || password.length < 6) return err("A display name, valid email, and a password of 6+ characters are required.");
+    await recordRateLimitEvent(env, "signup", ip);
     const existing = await env.DB.prepare(`SELECT id FROM users WHERE email=?`).bind(email).first();
     if (existing) return err("An account with that email already exists — try logging in instead.");
     const base = (body.username || displayName).toLowerCase().replace(/[^a-z0-9]/g, "") || "dj";
@@ -306,10 +348,19 @@ async function handle(request, env) {
     const body = await request.json();
     const email = (body.email || "").trim().toLowerCase();
     const password = body.password || "";
+    if (!(await checkRateLimit(env, "login", email))) {
+      return err("Too many failed sign-in attempts for this account. Please wait 15 minutes and try again.", 429);
+    }
     const user = await env.DB.prepare(`SELECT * FROM users WHERE email=?`).bind(email).first();
-    if (!user) return err("Incorrect email or password.", 401);
+    if (!user) {
+      await recordRateLimitEvent(env, "login", email);
+      return err("Incorrect email or password.", 401);
+    }
     const { hashHex } = await pbkdf2Hash(password, user.password_salt);
-    if (hashHex !== user.password_hash) return err("Incorrect email or password.", 401);
+    if (hashHex !== user.password_hash) {
+      await recordRateLimitEvent(env, "login", email);
+      return err("Incorrect email or password.", 401);
+    }
     const token = genToken();
     const expires = new Date(Date.now() + TOKEN_TTL_DAYS * 24 * 3600 * 1000).toISOString();
     await env.DB.prepare(`INSERT INTO auth_tokens (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, user.id, expires).run();
@@ -475,14 +526,22 @@ async function handle(request, env) {
     const row = token
       ? await env.DB.prepare(`SELECT u.* FROM auth_tokens t JOIN users u ON u.id=t.user_id WHERE t.token=? AND t.expires_at>datetime('now')`).bind(token).first()
       : null;
-    const stream = await env.DB.prepare(`SELECT id FROM streams WHERE id=?`).bind(streamId).first();
+    const stream = await env.DB.prepare(`SELECT id, dj_id FROM streams WHERE id=?`).bind(streamId).first();
     if (!stream) return err("Stream not found.", 404);
+    // A banned user can watch (viewer counts stay real for everyone) but
+    // can't rejoin that DJ's chat — enforced here, not just hidden in the UI.
+    if (row) {
+      const banned = await env.DB.prepare(`SELECT 1 FROM chat_bans WHERE dj_id=? AND banned_user_id=?`).bind(stream.dj_id, row.id).first();
+      if (banned) return err("You've been removed from this DJ's chat.", 403);
+    }
+    const role = row ? await chatRoleFor(env, stream.dj_id, row.id) : "viewer";
     const id = env.CHAT_ROOM.idFromName(streamId);
     const stub = env.CHAT_ROOM.get(id);
     const doUrl = new URL(request.url);
     doUrl.pathname = "/room";
     doUrl.searchParams.set("userId", row ? row.id : "");
     doUrl.searchParams.set("displayName", row ? row.display_name : "Guest");
+    doUrl.searchParams.set("role", role);
     return stub.fetch(new Request(doUrl.toString(), request));
   }
 
@@ -554,6 +613,146 @@ async function handle(request, env) {
     if (!user) return err("Sign in required.", 401);
     const { meta } = await env.DB.prepare(`DELETE FROM follows WHERE follower_id=? AND dj_id=?`).bind(user.id, djId).run();
     if (meta?.changes) await env.DB.prepare(`UPDATE users SET follower_count = MAX(0, follower_count - 1) WHERE id=?`).bind(djId).run();
+    return json({ ok: true });
+  }
+
+  // Moderators — a DJ's chosen chat moderators -------------------------------
+  if (path === "/api/moderators" && method === "GET") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const { results } = await env.DB.prepare(
+      `SELECT u.* FROM moderators m JOIN users u ON u.id = m.moderator_id WHERE m.dj_id=? ORDER BY m.created_at ASC`
+    )
+      .bind(user.id)
+      .all();
+    return json({ moderators: results.map(publicModerator) });
+  }
+  if (path === "/api/moderators" && method === "POST") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    if (!user.is_dj) return err("Only DJ accounts can appoint moderators.", 403);
+    const body = await request.json();
+    const handle = (body.username || "").trim().toLowerCase();
+    if (!handle) return err("Enter a username to add as a moderator.");
+    const target = await env.DB.prepare(`SELECT * FROM users WHERE username=? OR email=?`).bind(handle, handle).first();
+    if (!target) return err("No account found with that username.", 404);
+    if (target.id === user.id) return err("You can't appoint yourself.");
+    await env.DB.prepare(`INSERT OR IGNORE INTO moderators (dj_id, moderator_id) VALUES (?,?)`).bind(user.id, target.id).run();
+    return json({ moderator: publicModerator(target) });
+  }
+  if (path.match(/^\/api\/moderators\/[^/]+$/) && method === "DELETE") {
+    const modUserId = path.split("/")[3];
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    await env.DB.prepare(`DELETE FROM moderators WHERE dj_id=? AND moderator_id=?`).bind(user.id, modUserId).run();
+    return json({ ok: true });
+  }
+  // Which DJs the signed-in user moderates for — lets the frontend show
+  // moderation controls in the right chats without the DJ having to do
+  // anything special for that viewer.
+  if (path === "/api/moderators/mine" && method === "GET") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const { results } = await env.DB.prepare(`SELECT dj_id FROM moderators WHERE moderator_id=?`).bind(user.id).all();
+    return json({ djIds: results.map((r) => r.dj_id) });
+  }
+
+  // Chat bans — enforced both here (join-time) and live in the ChatRoom ------
+  if (path.match(/^\/api\/streams\/[^/]+\/chat\/ban$/) && method === "POST") {
+    const streamId = path.split("/")[3];
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const stream = await env.DB.prepare(`SELECT * FROM streams WHERE id=?`).bind(streamId).first();
+    if (!stream) return err("Stream not found.", 404);
+    const role = await chatRoleFor(env, stream.dj_id, user.id);
+    if (role === "viewer") return err("Only the DJ or one of their moderators can do that.", 403);
+    const body = await request.json();
+    if (!body.userId) return err("A userId is required.");
+    if (body.userId === stream.dj_id) return err("You can't ban the DJ.");
+    await env.DB.prepare(`INSERT OR REPLACE INTO chat_bans (dj_id, banned_user_id, banned_by, reason) VALUES (?,?,?,?)`)
+      .bind(stream.dj_id, body.userId, user.id, (body.reason || "").slice(0, 300))
+      .run();
+    try {
+      const id = env.CHAT_ROOM.idFromName(streamId);
+      const stub = env.CHAT_ROOM.get(id);
+      await stub.fetch("https://do/kick", { method: "POST", body: JSON.stringify({ userId: body.userId, reason: "banned" }) });
+    } catch (e) {}
+    return json({ ok: true });
+  }
+  if (path.match(/^\/api\/streams\/[^/]+\/chat\/unban$/) && method === "POST") {
+    const streamId = path.split("/")[3];
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const stream = await env.DB.prepare(`SELECT * FROM streams WHERE id=?`).bind(streamId).first();
+    if (!stream) return err("Stream not found.", 404);
+    const role = await chatRoleFor(env, stream.dj_id, user.id);
+    if (role === "viewer") return err("Only the DJ or one of their moderators can do that.", 403);
+    const body = await request.json();
+    await env.DB.prepare(`DELETE FROM chat_bans WHERE dj_id=? AND banned_user_id=?`).bind(stream.dj_id, body.userId).run();
+    return json({ ok: true });
+  }
+  if (path.match(/^\/api\/streams\/[^/]+\/chat\/bans$/) && method === "GET") {
+    const streamId = path.split("/")[3];
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const stream = await env.DB.prepare(`SELECT * FROM streams WHERE id=?`).bind(streamId).first();
+    if (!stream) return err("Stream not found.", 404);
+    const role = await chatRoleFor(env, stream.dj_id, user.id);
+    if (role === "viewer") return err("Only the DJ or one of their moderators can do that.", 403);
+    const { results } = await env.DB.prepare(
+      `SELECT u.id, u.username, u.display_name, b.reason, b.created_at FROM chat_bans b JOIN users u ON u.id = b.banned_user_id WHERE b.dj_id=? ORDER BY b.created_at DESC`
+    )
+      .bind(stream.dj_id)
+      .all();
+    return json({ bans: results.map((r) => ({ userId: r.id, username: r.username, displayName: r.display_name, reason: r.reason, bannedAt: r.created_at })) });
+  }
+
+  // Reports — any signed-in user can flag a message or a user ---------------
+  if (path === "/api/reports" && method === "POST") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Sign in required.", 401);
+    const body = await request.json();
+    if (!body.reason) return err("A reason is required.");
+    const id = genId("report");
+    await env.DB.prepare(
+      `INSERT INTO reports (id, reporter_id, reported_user_id, stream_id, message_text, reason, details) VALUES (?,?,?,?,?,?,?)`
+    )
+      .bind(id, user.id, body.reportedUserId || null, body.streamId || null, (body.messageText || "").slice(0, 300), body.reason.slice(0, 100), (body.details || "").slice(0, 1000))
+      .run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/reports" && method === "GET") {
+    const user = await getUserFromRequest(request, env);
+    if (!user || !isAdminEmail(env, user.email)) return err("Forbidden.", 403);
+    const status = url.searchParams.get("status") || "open";
+    const { results } = await env.DB.prepare(`SELECT * FROM reports WHERE status=? ORDER BY created_at ASC LIMIT 200`).bind(status).all();
+    const out = [];
+    for (const row of results) {
+      const reporter = await env.DB.prepare(`SELECT * FROM users WHERE id=?`).bind(row.reporter_id).first();
+      const reported = row.reported_user_id ? await env.DB.prepare(`SELECT * FROM users WHERE id=?`).bind(row.reported_user_id).first() : null;
+      out.push({
+        id: row.id,
+        reason: row.reason,
+        details: row.details || "",
+        messageText: row.message_text || "",
+        streamId: row.stream_id,
+        status: row.status,
+        createdAt: row.created_at,
+        reporter: publicUser(reporter),
+        reportedUser: reported ? publicUser(reported) : null,
+      });
+    }
+    return json({ reports: out });
+  }
+  if (path.match(/^\/api\/admin\/reports\/[^/]+\/(resolve|dismiss)$/) && method === "POST") {
+    const parts = path.split("/");
+    const reportId = parts[4];
+    const action = parts[5];
+    const user = await getUserFromRequest(request, env);
+    if (!user || !isAdminEmail(env, user.email)) return err("Forbidden.", 403);
+    await env.DB.prepare(`UPDATE reports SET status=?, reviewed_by=?, reviewed_at=datetime('now') WHERE id=?`)
+      .bind(action === "resolve" ? "resolved" : "dismissed", user.id, reportId)
+      .run();
     return json({ ok: true });
   }
 
