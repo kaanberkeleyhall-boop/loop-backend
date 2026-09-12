@@ -1047,6 +1047,10 @@ async function handle(request, env, ctx) {
       success_url: `${origin}/?tip_session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${origin}/?tip_cancelled=1`,
       metadata: { tipId, toDjId: body.toDjId, fromUserId: user.id, streamId: body.streamId || "", tierName: body.tierName || "", message: (body.message || "").slice(0, 120) },
+      // Stripe's newer "Managed Payments" (on by default for this account)
+      // requires a tax code on every line item unless it's turned off for
+      // the session — a tip isn't a taxable product sale, so skip it here.
+      managed_payments: { enabled: false },
     };
     // Split the payment at the moment it's paid: Loop's cut stays in the
     // platform balance, the rest transfers straight to the DJ's own
