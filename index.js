@@ -79,6 +79,7 @@ function publicUser(row) {
     bio: row.bio || "",
     isDj: !!row.is_dj,
     verified: row.dj_verification_status === "approved",
+    avatarUrl: row.avatar_data_url || "",
     genres: safeJson(row.genres, []),
     bpmMin: row.bpm_min,
     bpmMax: row.bpm_max,
@@ -100,6 +101,8 @@ function isAdminEmail(env, email) {
 const RATE_LIMITS = {
   login: { max: 8, windowMinutes: 15 },
   signup: { max: 6, windowMinutes: 60 },
+  password_reset: { max: 5, windowMinutes: 60 },
+  verify_resend: { max: 3, windowMinutes: 30 },
 };
 function clientIp(request) {
   return request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";
@@ -114,6 +117,81 @@ async function checkRateLimit(env, kind, key) {
 }
 async function recordRateLimitEvent(env, kind, key) {
   await env.DB.prepare(`INSERT INTO rate_limit_events (kind, rkey) VALUES (?,?)`).bind(kind, key).run();
+}
+
+// ── email — password reset, email verification, "DJ went live" notices ────
+// Sent through Resend's HTTP API (a real free tier, no credit card needed
+// for the volume a small platform sends) — configured entirely via two
+// Worker secrets (RESEND_API_KEY, RESEND_FROM_EMAIL), never hardcoded here.
+// Best-effort everywhere it's called: a failed send never blocks or fails
+// the request that triggered it (signup still succeeds even if the
+// verification email doesn't go out, etc.) — it's logged and swallowed.
+async function sendEmail(env, to, subject, html) {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+    console.log("Email not sent (RESEND_API_KEY/RESEND_FROM_EMAIL not configured):", subject, "→", to);
+    return false;
+  }
+  try {
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: env.RESEND_FROM_EMAIL, to, subject, html }),
+    });
+    if (!resp.ok) {
+      console.log("Resend send failed:", resp.status, await resp.text().catch(() => ""));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log("Resend send threw:", e.message);
+    return false;
+  }
+}
+function appUrl(env) {
+  return (env.ALLOWED_ORIGIN && env.ALLOWED_ORIGIN !== "*" ? env.ALLOWED_ORIGIN : "").replace(/\/$/, "");
+}
+function emailShell(title, bodyHtml) {
+  return `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#2c1c14;">
+    <h2 style="margin:0 0 16px;">${title}</h2>
+    ${bodyHtml}
+    <p style="margin-top:32px;font-size:12px;color:#8a7a6f;">— Loop</p>
+  </div>`;
+}
+async function createVerificationToken(env, userId, purpose, ttlMinutes) {
+  const token = genToken();
+  const expires = new Date(Date.now() + ttlMinutes * 60000).toISOString();
+  await env.DB.prepare(`INSERT INTO verification_tokens (token, user_id, purpose, expires_at) VALUES (?,?,?,?)`).bind(token, userId, purpose, expires).run();
+  return token;
+}
+async function consumeVerificationToken(env, token, purpose) {
+  const row = await env.DB.prepare(`SELECT * FROM verification_tokens WHERE token=? AND purpose=? AND used_at IS NULL AND expires_at > datetime('now')`).bind(token, purpose).first();
+  if (!row) return null;
+  await env.DB.prepare(`UPDATE verification_tokens SET used_at=datetime('now') WHERE token=?`).bind(token).run();
+  return row;
+}
+async function sendVerificationEmail(env, user) {
+  const token = await createVerificationToken(env, user.id, "email_verify", 60 * 24);
+  const link = `${appUrl(env)}/?verify=${token}`;
+  await sendEmail(env, user.email, "Verify your Loop account",
+    emailShell("Verify your email", `<p>Hi ${user.display_name || ""}, confirm this is your email address to finish setting up your Loop account.</p><p><a href="${link}" style="display:inline-block;background:#2f5b41;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;">Verify email</a></p><p style="font-size:12px;color:#8a7a6f;">Or paste this link: ${link}</p>`)
+  );
+}
+async function notifyFollowersLive(env, djId, streamTitle) {
+  try {
+    const dj = await env.DB.prepare(`SELECT display_name, username FROM users WHERE id=?`).bind(djId).first();
+    if (!dj) return;
+    const { results } = await env.DB.prepare(
+      `SELECT u.email, u.display_name FROM follows f JOIN users u ON u.id = f.follower_id WHERE f.dj_id=? AND u.notify_on_live=1 AND u.email_verified=1 LIMIT 200`
+    ).bind(djId).all();
+    const link = `${appUrl(env)}/`;
+    for (const follower of results) {
+      await sendEmail(env, follower.email, `${dj.display_name} is live now on Loop`,
+        emailShell(`${dj.display_name} just went live`, `<p>"${streamTitle}" is streaming right now.</p><p><a href="${link}" style="display:inline-block;background:#2f5b41;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;">Watch now</a></p>`)
+      );
+    }
+  } catch (e) {
+    console.log("notifyFollowersLive failed:", e.message);
+  }
 }
 
 // ── security: moderators & chat bans ─────────────────────────────────────
@@ -138,6 +216,8 @@ function privateUser(row, env) {
     twoFactorEnabled: !!row.two_factor_enabled,
     verificationStatus: row.dj_verification_status || "unverified",
     isAdmin: env ? isAdminEmail(env, row.email) : false,
+    emailVerified: !!row.email_verified,
+    notifyOnLive: row.notify_on_live == null ? true : !!row.notify_on_live,
   };
 }
 function publicVerification(row) {
@@ -274,7 +354,7 @@ async function cfStreamRequest(env, method, path, body) {
   if (!data.success) throw new Error((data.errors && data.errors[0] && data.errors[0].message) || "Cloudflare Stream request failed");
   return data.result;
 }
-async function goLiveInternal(env, streamRow) {
+async function goLiveInternal(env, streamRow, ctx) {
   const live = await cfStreamRequest(env, "POST", "/stream/live_inputs", { meta: { name: streamRow.title }, recording: { mode: "automatic" } });
   await env.DB.prepare(`UPDATE streams SET status='live', start_time=datetime('now'), live_input_uid=?, playback_uid=?, whip_url=?, rtmps_url=?, stream_key=? WHERE id=?`)
     .bind(live.uid, live.uid, live.webRTC?.url || null, live.rtmps?.url || null, live.rtmps?.streamKey || null, streamRow.id)
@@ -285,6 +365,9 @@ async function goLiveInternal(env, streamRow) {
   out.rtmpsUrl = row.rtmps_url;
   out.streamKey = row.stream_key;
   out.playerUrl = cfPlayerUrl(env, row.playback_uid);
+  // Best-effort, never blocks the response the DJ is waiting on — a DJ going
+  // live shouldn't stall because of an email provider hiccup.
+  if (ctx) ctx.waitUntil(notifyFollowersLive(env, row.dj_id, row.title).catch(() => {}));
   return out;
 }
 async function liveViewerCount(env, streamId) {
@@ -306,7 +389,7 @@ function cfPlayerUrl(env, uid) {
 }
 
 // ── router ────────────────────────────────────────────────────────────────
-async function handle(request, env) {
+async function handle(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -341,7 +424,61 @@ async function handle(request, env) {
     const expires = new Date(Date.now() + TOKEN_TTL_DAYS * 24 * 3600 * 1000).toISOString();
     await env.DB.prepare(`INSERT INTO auth_tokens (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, id, expires).run();
     const user = await env.DB.prepare(`SELECT * FROM users WHERE id=?`).bind(id).first();
+    ctx.waitUntil(sendVerificationEmail(env, user).catch(() => {}));
     return json({ token, user: privateUser(user, env) });
+  }
+
+  if (path === "/api/verify-email" && method === "POST") {
+    const body = await request.json();
+    const row = await consumeVerificationToken(env, body.token || "", "email_verify");
+    if (!row) return err("This verification link is invalid or has expired.", 400);
+    await env.DB.prepare(`UPDATE users SET email_verified=1 WHERE id=?`).bind(row.user_id).run();
+    return json({ ok: true });
+  }
+
+  if (path === "/api/resend-verification" && method === "POST") {
+    const user = await getUserFromRequest(request, env);
+    if (!user) return err("Not signed in.", 401);
+    if (user.email_verified) return json({ ok: true, alreadyVerified: true });
+    if (!(await checkRateLimit(env, "verify_resend", user.id))) return err("Please wait a bit before requesting another verification email.", 429);
+    await recordRateLimitEvent(env, "verify_resend", user.id);
+    await sendVerificationEmail(env, user);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/password-reset/request" && method === "POST") {
+    const body = await request.json();
+    const email = (body.email || "").trim().toLowerCase();
+    // Always the same response whether or not the email exists — never lets
+    // this endpoint be used to check which emails have Loop accounts.
+    if (email && (await checkRateLimit(env, "password_reset", email))) {
+      await recordRateLimitEvent(env, "password_reset", email);
+      const user = await env.DB.prepare(`SELECT * FROM users WHERE email=?`).bind(email).first();
+      if (user) {
+        const token = await createVerificationToken(env, user.id, "password_reset", 60);
+        const link = `${appUrl(env)}/?reset=${token}`;
+        ctx.waitUntil(
+          sendEmail(env, user.email, "Reset your Loop password",
+            emailShell("Reset your password", `<p>Someone requested a password reset for this account. If that was you, set a new password:</p><p><a href="${link}" style="display:inline-block;background:#2f5b41;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;">Reset password</a></p><p style="font-size:12px;color:#8a7a6f;">This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>`)
+          ).catch(() => {})
+        );
+      }
+    }
+    return json({ ok: true });
+  }
+
+  if (path === "/api/password-reset/confirm" && method === "POST") {
+    const body = await request.json();
+    const newPassword = body.newPassword || "";
+    if (newPassword.length < 6) return err("Password must be at least 6 characters.");
+    const row = await consumeVerificationToken(env, body.token || "", "password_reset");
+    if (!row) return err("This reset link is invalid or has expired.", 400);
+    const { hashHex, saltHex } = await pbkdf2Hash(newPassword);
+    await env.DB.prepare(`UPDATE users SET password_hash=?, password_salt=? WHERE id=?`).bind(hashHex, saltHex, row.user_id).run();
+    // Force re-login everywhere — a reset should invalidate any session that
+    // might belong to whoever no longer has the (possibly compromised) old password.
+    await env.DB.prepare(`DELETE FROM auth_tokens WHERE user_id=?`).bind(row.user_id).run();
+    return json({ ok: true });
   }
 
   if (path === "/api/login" && method === "POST") {
@@ -399,6 +536,20 @@ async function handle(request, env) {
     if (body.bpmMax !== undefined) set("bpm_max", body.bpmMax);
     if (body.mediaAccessEnabled !== undefined) set("media_access_enabled", body.mediaAccessEnabled ? 1 : 0);
     if (body.twoFactorEnabled !== undefined) set("two_factor_enabled", body.twoFactorEnabled ? 1 : 0);
+    if (body.notifyOnLive !== undefined) set("notify_on_live", body.notifyOnLive ? 1 : 0);
+    if (body.avatarUrl !== undefined) {
+      // Stored directly in D1 as a data: URL — no separate image/CDN product,
+      // so this stays tightly capped: only a data:image/... value, and small
+      // enough that a resized (client-side, before upload) photo always fits
+      // comfortably well under it.
+      if (body.avatarUrl === "") {
+        set("avatar_data_url", "");
+      } else if (typeof body.avatarUrl === "string" && /^data:image\/(png|jpeg|jpg|webp);base64,/.test(body.avatarUrl) && body.avatarUrl.length <= 400000) {
+        set("avatar_data_url", body.avatarUrl);
+      } else {
+        return err("Profile photo is invalid or too large.", 400);
+      }
+    }
     if (fields.length) {
       binds.push(user.id);
       await env.DB.prepare(`UPDATE users SET ${fields.join(", ")} WHERE id=?`).bind(...binds).run();
@@ -409,12 +560,19 @@ async function handle(request, env) {
 
   if (path === "/api/users" && method === "GET") {
     const isDj = url.searchParams.get("isDj");
+    const search = (url.searchParams.get("q") || "").trim();
+    const sort = url.searchParams.get("sort") || "followers"; // followers | newest
     let q = "SELECT * FROM users";
+    const clauses = [];
     const binds = [];
-    if (isDj) {
-      q += " WHERE is_dj=1";
+    if (isDj) clauses.push("is_dj=1");
+    if (search) {
+      clauses.push("(display_name LIKE ? OR username LIKE ? OR city LIKE ? OR genres LIKE ?)");
+      const like = `%${search}%`;
+      binds.push(like, like, like, like);
     }
-    q += " ORDER BY follower_count DESC LIMIT 100";
+    if (clauses.length) q += " WHERE " + clauses.join(" AND ");
+    q += sort === "newest" ? " ORDER BY created_at DESC LIMIT 100" : " ORDER BY follower_count DESC LIMIT 100";
     const { results } = await env.DB.prepare(q).bind(...binds).all();
     return json({ users: results.map(publicUser) });
   }
@@ -481,7 +639,7 @@ async function handle(request, env) {
     let row = await env.DB.prepare(`SELECT * FROM streams WHERE id=?`).bind(id).first();
     let stream = publicStream(row);
     if (body.goLiveNow) {
-      stream = await goLiveInternal(env, row);
+      stream = await goLiveInternal(env, row, ctx);
     }
     return json({ stream });
   }
@@ -496,7 +654,7 @@ async function handle(request, env) {
     if (user.dj_verification_status !== "approved") {
       return err("Your DJ account needs to be verified before you can go live. Submit your verification from Studio.", 403);
     }
-    const stream = await goLiveInternal(env, row);
+    const stream = await goLiveInternal(env, row, ctx);
     return json({ stream });
   }
 
@@ -937,12 +1095,12 @@ async function handle(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
     try {
-      const resp = await handle(request, env);
+      const resp = await handle(request, env, ctx);
       if (resp.webSocket) return resp; // never rewrap a WebSocket upgrade
       const headers = new Headers(resp.headers);
       const cors = corsHeaders(env, request);
